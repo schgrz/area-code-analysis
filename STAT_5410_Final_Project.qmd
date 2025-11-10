@@ -1,0 +1,1541 @@
+---
+title: "STAT 5410 Final Project"
+subtitle: "Analysis of Area Codes"
+author: "Alex Schwarz"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: inline
+tbl-colwidths: [75,25]
+toc: true
+---
+
+# Environment Setup
+
+Below is a list of the libraries used during this project to help with the analysis.
+
+```{r}
+#| label: load-packages
+#| warning: false
+
+library(tidyverse) # ggplot2, dplyr, tidyr, readr, purrr, tibble, stringr, forcats, lubridate
+library(readxl) # Used reading in Excel data
+library(sf) # Used for reading the simple features data
+library(janitor) # clean_names()
+library(broom) # tidy()
+library(tidymodels) # recipes / workflows / parsnip
+library(glmnet) # classification regression
+library(kknn) # used for K-Nearest Neighbors
+library(rsample) # used for validation testing
+library(knitr) # used for displaying tables
+
+select <- dplyr::select
+theme_set(theme_bw())
+```
+
+# Data Information
+
++-------------------------+--------------------------------------------------------------------------------+
+| Data Frame Name         | Description                                                                    |
++=========================+================================================================================+
+| sf_data                 | Simple Features shapes for the maps of counties in the U.S.                    |
+|                         |                                                                                |
+|                         | -   `AREA`: the area of the region in terms of thousands of square kilometers. |
+|                         | -   `STATE`: providing the state FIPS code.                                    |
+|                         | -   `COUNTY`: providing the county FIPS code.                                  |
+|                         | -   `NAME`: Providing the name of the county                                   |
+|                         | -   `geometry` containing the simple features object of the area.              |
++-------------------------+--------------------------------------------------------------------------------+
+| splits_overlays         | Original American area codes.                                                  |
+|                         |                                                                                |
+|                         | -   `Code`: the zip code                                                       |
+|                         | -   `year`: year the code was first used                                       |
+|                         | -   `original`: logical variable if it was or wasn't the original area code    |
+|                         | -   `territory`: area covered by the code today (state (county(ies)))          |
++-------------------------+--------------------------------------------------------------------------------+
+| cities_area_codes_final | -   `area_code`: the zip code                                                  |
+|                         | -   `city`: city/town of the state it's located                                |
+|                         | -   `state_or_province`: state or province                                     |
+|                         | -   `country`: country it pertains to                                          |
++-------------------------+--------------------------------------------------------------------------------+
+| censusdata              | -   `state_name`: state name                                                   |
+|                         | -   `state_fips_code`: state fips code associated                              |
+|                         | -   `county_fips_code`: county fips code associated                            |
+|                         | -   `county_name`: county name                                                 |
+|                         | -   `population_1950`: population of a county in 1950                          |
+|                         | -   `residence_telephones_1945`: count of telephones in 1945                   |
+|                         | -   `population_under5_1950`: population of people under 5 in 1950             |
+|                         | -   `population_over65_1950`: population of people over 65 in 1950             |
+|                         | -   `births`: number of births                                                 |
+|                         | -   `black_pop`: population of black individuals                               |
++-------------------------+--------------------------------------------------------------------------------+
+| merged_counties_1950    | -   `county_name`: county name                                                 |
+|                         | -   `state_fips`: state fips code                                              |
+|                         | -   `state_name`: state name                                                   |
+|                         | -   `old_county_fips`: original county fips code                               |
+|                         | -   `new_county_fips`: new county fips code that it merged into                |
++-------------------------+--------------------------------------------------------------------------------+
+| new_counties_1950       | -   `state`: state name                                                        |
+|                         | -   `state_fips`: state fips code                                              |
+|                         | -   `new_county_name`: new county name it became                               |
+|                         | -   `new_county_fips`: new county fips code assigned                           |
+|                         | -   `old_county_name`: old county name changed from                            |
+|                         | -   `old_county_fips`: original county fips code                               |
++-------------------------+--------------------------------------------------------------------------------+
+
+# Data Loading
+
+```{r}
+#| label: load-data
+#| warning: false
+#| results: false
+
+# Show all files in our data folder
+list.files("data")
+
+# Read main files
+cities_area_codes_final <- read.csv("data/cities_area_codes_final.csv")
+censusdata <- read.csv("data/county_census_info.csv")
+merged_counties_1950 <- read.csv("data/merged_counties_since_1950.csv")
+new_counties_1950 <- read.csv("data/new_counties_since_1950.csv")
+```
+
+```{r}
+#| label: load-data-splits-overlays
+#| warning: false
+#| results: false
+
+# Set sheet names
+sheets <- excel_sheets("data/splits_overlays.xlsx")
+
+# Read splits_overlays file for each tab
+splits_overlays <- tibble(path = "data/splits_overlays.xlsx",
+                          zips = sheets)
+
+splits_overlays <- splits_overlays |>
+  rowwise() |>
+  mutate(splits_overlays = list(read_xlsx(path,
+                                          sheet = zips)))
+
+# Unnest each page to create one df
+splits_overlays <- splits_overlays |>
+  select(original_area_code = zips,
+         splits_overlays) |>
+  unnest(splits_overlays)
+```
+
+```{r}
+#| label: load-data-sf
+#| warning: false
+#| results: false
+
+# Load sf data
+sf_data <- st_read("data/co99_d00_shp/co99_d00.shp")
+
+sf_data <- sf_data |>
+  st_set_crs(4269)
+```
+
+Additional data set pulled from <https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt> to make it easier to reference combining data
+
+```{r}
+#| warning: false
+#| results: false
+
+# Load state FIPS codes
+state_fips <- read.csv("data/state_fips.csv")
+```
+
+# Data Cleaning
+
+## state_fips
+
+```{r}
+#| warning: false
+#| results: false
+
+# Change state name to title case
+state_fips <- state_fips |>
+  mutate(state_name = str_to_title(state_name)) |>
+  glimpse()
+
+# Commented out after use
+# Check what Hawaii and Alaska are to remove
+# state_fips |>
+#   filter(state_name %in% c("Hawaii",
+#                            "Alaska"))
+```
+
+## sf_data
+
+```{r}
+#| warning: false
+#| results: false
+
+# Update field data types
+# Rename fields to be consistent
+# Filter out Alaska and Hawaii
+sf_data <- sf_data |>
+  clean_names() |>
+  mutate(state = as.integer(state),
+         county = as.integer(county),
+         lsad = as.integer(lsad)) |>
+  rename(county_fips = county,
+         state_fips = state,
+         county_name = name) |>
+  # Filter out Hawaii and Alaska
+  filter(!state_fips %in% c(2,
+                            15),
+         lsad_trans == "County")
+
+# Preview
+sf_data |>
+  glimpse()
+```
+
+## splits_overlays
+
+```{r}
+#| warning: false
+#| results: false
+
+# Update correct field types
+# Remove unnecessary rows
+splits_overlays <- splits_overlays |>
+  mutate(original_area_code = as.integer(original_area_code),
+         new_area_code = as.integer(code),
+         year = as.integer(year)) |>
+  select(-code, -territory, -year)
+
+splits_overlays |>
+  glimpse()
+```
+
+## cities_area_codes_final
+
+```{r}
+#| warning: false
+#| results: false
+
+# Filter for area codes only in the US or USA
+# Filter out Alaska and Hawaii
+cities_area_codes_final <- cities_area_codes_final |>
+  filter(country %in% c("US",
+                        "USA")) |>
+  rename(state_name = state_or_province) |>
+  filter(!state_name %in% c("Alaska",
+                            "Hawaii"))
+  
+cities_area_codes_final |>
+  glimpse()
+```
+
+## censusdata
+
+```{r}
+#| warning: false
+#| results: false
+
+# Fix string casing
+# Fix field names
+# Filter out Alaska and Hawaii
+censusdata <- censusdata |>
+  mutate(state_name = str_to_title(state_name),
+         county_name = str_to_title(county_name)) |>
+  rename(state_fips = state_fips_code,
+         county_fips = county_fips_code) |>
+  filter(!state_name %in% c("Alaska",
+                            "Hawaii"))
+
+censusdata |>
+  glimpse()
+```
+
+## merged_counties_1950
+
+```{r}
+#| warning: false
+#| results: false
+
+# Fix field cases
+# Filter out Alaska and Hawaii
+merged_counties_1950 <- merged_counties_1950 |>
+  mutate(county_name = str_to_title(county_name),
+         state_name = str_to_title(state_name)) |>
+  filter(!state_name %in% c("Alaska",
+                            "Hawaii")) |>
+  glimpse()
+```
+
+## new_counties_1950
+
+```{r}
+#| warning: false
+#| results: false
+
+# Fix field name
+new_counties_1950 <- new_counties_1950 |>
+  rename(state_name = state) 
+
+new_counties_1950 |>
+  glimpse()
+```
+
+# COMPONENT 1
+
+Create map visualizations of the complete areas corresponding to the original area codes.
+
+Visualizing the entire USA leads to a graphic that is much too crowded with far too many area codes. As such, I request that you instead include individual graphics for six different states of your choice. The graphic should show a map of the state, with regions colored according to their area.
+
+At least four of the states included must be from the list of multi-code states:
+
+-   California
+
+-   New York
+
+-   Texas
+
+-   Pennsylvania
+
+-   Ohio
+
+-   Illinois
+
+-   Minnesota
+
+-   Michigan
+
+-   Missouri
+
+-   Kansas
+
+-   Indiana
+
+-   Iowa
+
+-   Massachusetts
+
+-   Wisconsin
+
+For your reference, [this website](https://lincmad.com/map1947.html) shows someone’s hand-drawn version of the approximate numbering plan for the entire US, using text instead of colors. [This technical report](https://underunderstood.com/podcast/wp-content/uploads/2021/03/NPA-History-and-Map.pdf) from Bell Labs contains a similar hand-drawn map (Map 3) on the final page.
+
+Note 1: Our area code by city dataset does not contain cities in every US county, so there will be some counties where the true original area code assignment data is missing and you’ll need to impute it with a model-based guess. As such, I do not expect your map to perfectly align with those shown above, particular for low-population counties. These low population counties are unlikely to impact the results anyway.
+
+Note 2: You may notice that your final map for California differs quite a bit from the renderings above. That is because the area code 916 has complete moved areas since it was originally proposed, causing a bunch of weird data issues. So, don’t worry if your California map looks different in the North.
+
+## Data Preparation
+
+### Combine splits_overlays to cities_area_codes_final
+
+```{r}
+#| warning: false
+#| results: false
+# Add splits_overlays to cities_area_codes_final
+area_codes_combined <- cities_area_codes_final |>
+  left_join(splits_overlays,
+            by = join_by(area_code == new_area_code)) |>
+    rename(new_area_code = area_code) |>
+  glimpse()
+```
+
+### Combine sf_data with the combined data
+
+```{r}
+#| warning: false
+#| results: false
+# Convert the combined df to a simple features df
+sf_areacodes <- st_as_sf(area_codes_combined,
+                         coords = c("longitude", "latitude"),
+                         crs = 4269) |>
+  glimpse()
+
+# Join sf_data with our new sf_areacodes. This joins based on point geometry within polygon geometry
+cities_with_counties <- st_join(sf_areacodes,
+                                sf_data)
+
+cities_with_counties <- cities_with_counties |>
+  mutate(state_fips = if_else(state_fips == 55 & state_name == "Minnesota",
+                               27,
+                               state_fips))
+
+# Drop point geometry from our combined data to join polygon data in the next step
+cities_with_counties_nogeom <- st_drop_geometry(cities_with_counties) |>
+  glimpse()
+
+
+# Join new data on sf_data preserve polygon data. Note: This will create NA's as sf_data contains more
+combined_sf <- sf_data |>
+  left_join(cities_with_counties_nogeom) |>
+  glimpse()
+
+
+# Change original_area_code to a factor
+combined_sf <- combined_sf |>
+  mutate(original_area_code = as.factor(original_area_code))
+```
+
+## Visualize Maps - Before Predictions
+
+```{r}
+#| warning: false
+#| results: false
+#| echo: false
+
+# Running this code gives us the corresponding state FIPS code as a list 
+# Needed for plotting visualizations
+state_fips |>
+  filter(state_name %in% c("California",
+                           "Massachusetts",
+                           "Minnesota",
+                           "Wisconsin",
+                           "Connecticut",
+                           "Washington",
+                           "Iowa"))
+```
+
+### California
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(combined_sf |>
+            filter(state_fips == 6),
+          mapping = aes(fill = original_area_code,
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Connecticut
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(combined_sf |>
+            filter(state_fips == 9),
+          mapping = aes(fill = original_area_code,
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Massachusetts
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(combined_sf |>
+            filter(state_fips == 25),
+          mapping = aes(fill = original_area_code,  
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Minnesota
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(combined_sf |>
+            filter(state_fips == 27),
+          mapping = aes(fill = original_area_code,
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Washington
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(combined_sf |>
+            filter(state_fips == 53),
+          mapping = aes(fill = original_area_code,
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Wisconsin
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(combined_sf |>
+            filter(state_fips == 55),
+          mapping = aes(fill = original_area_code,
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+## Impute Predictions
+
+### Create Lat / Long
+
+```{r}
+#| warning: false
+#| results: false
+# Create longitude and latitude from the geometry field
+combined_sf <- combined_sf |>  
+  mutate(centroid = st_centroid(geometry) |>
+           st_coordinates(),
+         centroid_lat = centroid[,2],
+         centroid_long = centroid[,1]) |>
+  select(-centroid)
+```
+
+### Create training and missing data
+
+```{r}
+#| warning: false
+#| results: false
+# Split into two datasets, original missing and original present
+combined_sf_train <- combined_sf |>
+  filter(!is.na(original_area_code)) |>
+  glimpse()
+
+combined_sf_train |>
+  filter(state_fips == 55)
+
+combined_sf_missing <- combined_sf |>
+  filter(is.na(original_area_code)) |>
+  glimpse()
+```
+
+### Set up classification model
+
+```{r}
+#| warning: false
+#| results: false
+# Set up the classification model
+classification_knn <- nearest_neighbor(neighbors = 1,
+                                       weight_func = "rectangular") |>
+  set_engine("kknn") |>
+  set_mode("classification")
+```
+
+### Fit the model and predict values
+
+```{r}
+#| warning: false
+#| results: false
+# Fit the model
+og_codes_fit <- classification_knn |>
+  fit(original_area_code ~ centroid_lat + centroid_long + state_fips,
+      data = combined_sf_train)
+
+# Predict
+og_codes_predict <- og_codes_fit |>
+  predict(combined_sf_missing,
+          type = "class")
+```
+
+### Add predicted values to missing data
+
+```{r}
+#| warning: false
+#| results: false
+# Add the predictions to the missing data
+combined_sf_fixed <- combined_sf_missing |>
+  mutate(original_area_code = og_codes_predict |>
+           pull(.pred_class))
+```
+
+### Re-Combine data sets
+
+```{r}
+#| warning: false
+#| results: false
+# Re-combine the data
+og_codes_fixed <- combined_sf_train |>
+  bind_rows(combined_sf_fixed)
+```
+
+## Visualize Maps - After Predictions
+
+### California
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(og_codes_fixed |>
+            filter(state_fips == 6),
+          mapping = aes(fill = as.factor(original_area_code),
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Connecticut
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(og_codes_fixed |>
+            filter(state_fips == 9),
+          mapping = aes(fill = as.factor(original_area_code),
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Massachusetts
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(og_codes_fixed |>
+            filter(state_fips == 25),
+          mapping = aes(fill = as.factor(original_area_code),
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Minnesota
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(og_codes_fixed |>
+            filter(state_fips == 27),
+          mapping = aes(fill = as.factor(original_area_code),
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Washington
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(og_codes_fixed |>
+            filter(state_fips == 53),
+          mapping = aes(fill = as.factor(original_area_code),
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+### Wisconsin
+
+```{r}
+#| echo: false
+
+# Graph to review
+ggplot() +
+  geom_sf(og_codes_fixed |>
+          filter(state_fips == 55),
+          mapping = aes(fill = as.factor(original_area_code),
+                        geometry = geometry),
+          color = "black") +
+  labs(fill = "Original Area Code")
+```
+
+# COMPONENT 2
+
+Conduct an analysis to investigate the question: were higher population areas more likely to be assigned area codes that were faster to dial (required fewer dial pulls) on rotary phones?
+
+Your analysis should include at least one formal hypothesis test with a p-value, as well as at least one graphic illustrating your findings.
+
+Depending on how you approach the problem, it might be worth considering one-code and multiple-code states separately.
+
+## **Research Question:**
+
+Do regions with larger populations tend to have area codes that are faster to dial, as determined by the number of dial pulls required?
+
+For this problem, a "region" is determined by the county. Each county corresponds to a given population size and is assigned an area code used in the dial pull. I will be determining the relationship between population size and the number of dial pulls.
+
+## **Hypothesis:**
+
+*Null Hypothesis*: There is no significant relationship between a region's population size and the number of dial pulls .
+
+*Alternative Hypothesis:* There is a significant relationship between a region's population size and the number of dial pulls.
+
+## Data Preparation
+
+### Data Aggregation
+
+```{r}
+#| warning: false
+#| results: false
+
+# Take the original codes with fixed/imputed areas and add new counties
+og_codes_fixed_1 <- og_codes_fixed |>
+  left_join(new_counties_1950,
+            by = join_by(state_fips == state_fips,
+                         county_fips == new_county_fips,
+                         county_name == new_county_name)) |>
+  mutate(county_fips = if_else(is.na(old_county_fips),
+                               county_fips,
+                               old_county_fips),
+         county_name = if_else(is.na(old_county_fips),
+                               county_name,
+                               old_county_name),
+         state_name = state_name.x) |>
+  select(-state_name.x, -state_name.y, -old_county_name, -old_county_fips) |>
+           glimpse()
+
+# Take that new one and add merged counties
+og_codes_fixed_1 <- og_codes_fixed_1 |>
+  bind_rows(merged_counties_1950) |>
+  mutate(county_fips = if_else(is.na(county_fips),
+                               old_county_fips,
+                               county_fips)) |>
+  select(-new_county_fips, -old_county_fips) |>
+  glimpse()
+```
+
+```{r}
+#| warning: false
+#| results: false
+
+# Add census data for populations and get only the distinct populations
+states_population_combined <- og_codes_fixed_1 |>
+  select(-city,
+         -original,
+         -state_name,
+         -country) |>
+  distinct() |>
+  left_join(censusdata,
+            by = join_by(state_fips == state_fips,
+                         county_fips == county_fips)) |>
+  distinct(state_fips, county_fips, population_1950, .keep_all = TRUE) |>
+  mutate(county_name = county_name.x) |>
+  select(-county_name.x, -county_name.y) |>
+  glimpse()
+
+states_population_combined <- states_population_combined |>
+  filter(!is.na(lsad_trans)) |>
+  glimpse()  
+```
+
+### Setting up the dial-pull calculations
+
+```{r}
+#| warning: false
+#| results: false
+
+
+# Create dial pull number by adding the distances 1-0 (0 = 10 as it's furthest away)
+states_population_combined_dials <- states_population_combined |>
+  mutate(original_area_code = as.character(original_area_code)) |>
+  separate_wider_position(cols = original_area_code,
+                          c(digit1 = 1,
+                            digit2 = 1,
+                            digit3 = 1)) |>
+  mutate(original_area_code = str_c(as.character(digit1),
+                                    as.character(digit2),
+                                    as.character(digit3)),
+         digit1 = as.integer(digit1),
+         digit2 = as.integer(digit2),
+         digit3 = as.integer(digit3)) |>
+  mutate(digit1 = if_else(digit1 == 0, 10, digit1),
+         digit2 = if_else(digit2 == 0, 10, digit2),
+         digit3 = if_else(digit3 == 0, 10, digit3)) |>
+  mutate(dial_pulls = as.integer(digit1 + digit2 + digit3))
+
+# Filter out columns that aren't necessary
+states_population_combined_dials_filtered <- states_population_combined_dials |>
+  select(-area, -perimeter, -co99_d00, -co99_d00_i, - lsad, -lsad_trans) |>
+  glimpse()
+
+states_population_combined_dials_filtered |>
+  filter(population_1950 >0) |>
+  glimpse()
+```
+
+## Create the linear regression model and fit the data
+
+```{r}
+#| warning: false
+#| results: false
+
+# Create a linear model
+parsnip_lm <- linear_reg() |>
+  set_mode("regression") |>
+  set_engine("lm")
+
+parsnip_lm_fit <- parsnip_lm |>
+  fit(log(population_1950) ~ dial_pulls,
+      data = states_population_combined_dials_filtered |>
+              filter(population_1950 > 0,
+                     !is.na(original_area_code)))
+```
+
+The fit model we receive shows that for every 1 unit of increase in dial pulls, the log decrease in population is -.0575. This is accompanied with a t-statistic of -11.6 and a p-value of 2.62e-30 suggesting that a relatively large negative value for t-statistic means the effect is significantly different from 0 (the null hypothesis). Additionally, the observations we get show that the model is indicative of showing a strong significance as the p-value we receive is much lower than a .05 threshold in which we typically determine the ability to reject the null hypothesis in support of the alternative hypothesis.
+
+```{r}
+#| echo: false
+
+parsnip_lm_fit |>
+  tidy()
+```
+
+## View the data
+
+Below, we see a graphical representation, plotting each dial pull with its corresponding log(population). The log-transformed population number was used to normalize the data points to be more visually represented. I've fitted a linear regression line to visualize the trend. As number of dial pulls increases, the expected population count goes down.
+
+```{r}
+#| echo: false
+#| message: false
+
+states_population_combined_dials_filtered |>
+  select(state_fips,
+         state_name,
+         county_name,
+         original_area_code,
+         dial_pulls,
+         population_1950) |>
+  filter(population_1950 > 0) |>
+  ggplot(aes(x = dial_pulls,
+             y = log(population_1950))) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Average (log)Population to Dial Pulls",
+       x = "Dial Pulls",
+       y = "Average Population")
+```
+
+Below, we can see the distribution of log(populations) for each dial pull.
+
+```{r}
+#| echo: false
+#| message: false
+
+states_population_combined_dials_filtered |>
+  select(state_fips,
+         state_name,
+         county_name,
+         original_area_code,
+         dial_pulls,
+         population_1950) |>
+  filter(population_1950 > 0) |>
+  ggplot(aes(x = dial_pulls,
+             y = log(population_1950),
+             group = dial_pulls)) +
+  geom_boxplot() +
+  labs(title = "Average (log)Population to Dial Pulls",
+       x = "Dial Pulls",
+       y = "Average Population")
+```
+
+Additionally, when we take the average population for each level, we continue to see a downward trend. As dial pulls increase, we expect to see a decrease in population.
+
+```{r}
+#| echo: false
+#| message: false
+
+states_population_combined_dials_filtered |>
+  filter(population_1950 > 0) |>
+  group_by(dial_pulls) |>
+  summarize(mean_population = mean(log(population_1950))) |> 
+  ggplot(aes(x = dial_pulls,
+             y = mean_population)) +
+  geom_line() +
+  geom_smooth(method = "lm") + 
+  labs(title = "Average (log)Population to Dial Pulls",
+       x = "Dial PUlls",
+       y = "Average Population")
+```
+
+This graph was better showing the relationship of log(population) and shows as the number of dial pulls increases, the population is expected to decrease on average.
+
+Fitting a linear regression model, we see that the statistic is largely negative, along with a very small p-value, showing that the data we observe is congruent with the expectation that higher populations experience lower dial pulls and we have evidence to reject the null hypothesis that there is no significant effect of dial pulls on population in favor of the alternative hypothesis that dial pulls do show a statistical significance.
+
+# COMPONENT 3
+
+Identify regions that you believe were given codes that were unfairly slow to dial given their population. Likewise, identify some regions that you believe were given codes that were unfairly fast to dial.
+
+Provide at least one graphic supporting your claims.
+
+## Predict dial populations based on their dial pulls
+
+```{r}
+#| results: false
+parsnip_lm_pred <- predict(parsnip_lm_fit,
+                           new_data = states_population_combined_dials_filtered |>
+                             filter(population_1950 > 0,
+                                    !is.na(original_area_code)))
+
+parsnip_lm_pred |>
+  glimpse()
+```
+
+## Plot the residuals
+
+The residual values plotted below show the difference of the predicted value from that of the expected value at a specific level. I've also included a confidence interval at the mean of the residuals + and - 2 times the standard deviation. Observations outside of these, I've marked as being unfairly assigned area codes too slow or too fast.
+
+```{r}
+#| echo: false
+
+states_population_combined_dials_filtered |>
+                             filter(population_1950 > 0,
+                                    !is.na(original_area_code)) |>
+  mutate(pred_class = parsnip_lm_pred |>
+           pull(.pred),
+         population = log(population_1950)) |>
+  select(new_area_code,
+         population,
+         dial_pulls,
+         pred_class) |>
+  mutate(residuals = population - pred_class,
+         mean = mean(residuals),
+         upper = mean  + 2  * sd(residuals),
+         lower = mean - 2 * sd(residuals)) |>
+  ggplot(aes(x = dial_pulls,
+             y = residuals)) +
+  geom_point() + 
+  geom_line(aes(x = dial_pulls,
+                y = upper)) + 
+  geom_line(aes(x = dial_pulls,
+                y = lower))
+```
+
+## Area codes identified as being unfairly fast
+
+```{r}
+#| echo: false
+
+states_population_combined_dials_filtered |>
+                             filter(population_1950 > 0,
+                                    !is.na(original_area_code)) |>
+  mutate(pred_class = parsnip_lm_pred |>
+           pull(.pred),
+         population = log(population_1950)) |>
+  select(county_name,
+         state_name,
+         original_area_code,
+         population,
+         dial_pulls,
+         pred_class) |>
+  mutate(residuals = population - pred_class,
+         mean = mean(residuals),
+         upper = mean  + 2  * sd(residuals),
+         lower = mean - 2 * sd(residuals)) |>
+  filter(residuals > upper) |>
+  select(county_name, state_name, original_area_code) |>
+  print(n = 115)
+```
+
+## Area codes identified as being unfairly slow
+
+```{r}
+#| echo: false
+
+states_population_combined_dials_filtered |>
+                             filter(population_1950 > 0,
+                                    !is.na(original_area_code)) |>
+  mutate(pred_class = parsnip_lm_pred |>
+           pull(.pred),
+         population = log(population_1950)) |>
+  select(county_name,
+         state_name,
+         original_area_code,
+         population,
+         dial_pulls,
+         pred_class) |>
+  mutate(residuals = population - pred_class,
+         mean = mean(residuals),
+         upper = mean  + 2  * sd(residuals),
+         lower = mean - 2 * sd(residuals)) |>
+  filter(residuals < lower) |>
+  select(county_name, state_name, original_area_code) |>
+  print(n = 56)
+```
+
+# COMPONENT 4
+
+The year 1947 predated some of the important anti-discrimination laws in the US, including Brown v. Board of Education, the Civil Rights act of 1964, and the voting rights act of 1965.
+
+With regards to area code assignment, can you identify any evidence of anti-black discrimination (in terms of dialing speed) by AT&T against counties with larger African American populations?
+
+You may answer this question graphically, with a formal hypothesis test, or both.
+
+## Graphical representation of Population, removing the count of Black Population
+
+The following is a representation of the population with Black population removed.
+
+```{r}
+#| warning: false
+#| echo: false
+
+states_population_combined_dials_filtered |>
+  mutate(other_pop = population_1950 - black_pop) |>
+  filter(other_pop > 0) |>
+  ggplot(aes(x = dial_pulls,
+             y = log(other_pop))) +
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  labs(title = "(log)Population (Removing Black Population) to Dial Pulls",
+       x = "Dial Pulls",
+       y = "(log) Population")
+```
+
+```{r}
+#| warning: false
+#| echo: false
+
+states_population_combined_dials_filtered |>
+  mutate(other_pop = population_1950 - black_pop) |>
+  filter(other_pop > 0) |>
+  group_by(dial_pulls) |>
+  summarize(mean_population = mean(log(other_pop))) |>
+  ggplot(aes(x = dial_pulls,
+             y = mean_population)) + 
+  geom_line() +
+  labs(title = "(log) Average Population Removing Black Population to Dial Pulls",
+       x = "Dial Pulls",
+       y = "(log) Average Population")
+```
+
+## Fit the model and show the results
+
+```{r}
+#| warning: false
+#| results: false
+
+parsnip_lm_fit_other <- parsnip_lm |>
+  fit(log(other_pop) ~ dial_pulls,
+      data = states_population_combined_dials_filtered |>
+        mutate(other_pop = population_1950 - black_pop) |>
+        filter(other_pop > 0))
+```
+
+The following graph shows a negative relationship. As Dial Pulls increases, the population size is expected to decrease. Fitting a linear model to the data shows that for every 1 unit of increase in dial pulls, the log decrease in population is -.0747. This is accompanied with a t-statistic of -14.9 and a p-value of 1.02e-48 suggesting that a relatively large negative value for t-statistic means the effect is significantly different from 0. Additionally, the observations we get show that the model is indicative of showing a strong significance as the p-value we receive is much lower than a .05 threshold in which we typically determine the ability to reject the null hypothesis in support of the alternative hypothesis.
+
+```{r}
+#| echo: false
+
+parsnip_lm_fit_other |>
+  tidy()
+```
+
+## Graphical representation of Black Population
+
+```{r}
+#| echo: false 
+#| message: false
+#| warning: false
+
+states_population_combined_dials_filtered |>
+  filter(black_pop > 0) |>
+  ggplot(aes(x = dial_pulls,
+             y = log(black_pop))) +
+  geom_point() + 
+  geom_smooth(method = "lm") +
+  labs(title = "(log) Black Population to Dial Pulls",
+       x = "Dial Pulls",
+       y = "(log) Black Population")
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+states_population_combined_dials_filtered |>
+  filter(black_pop > 0) |>
+  group_by(dial_pulls) |>
+  summarize(mean_population = mean(log(black_pop))) |>
+  ggplot(aes(x = dial_pulls,
+             y = mean_population)) + 
+  geom_line() +
+  labs(title = "(log) Average Black Population to Dial Pulls",
+       x = "Dial Pulls",
+       y = "(log) Average Black Population")
+```
+
+## Fit the model and show the results
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+parsnip_lm_fit_black <- parsnip_lm |>
+  fit(log(black_pop) ~ dial_pulls,
+      data = states_population_combined_dials_filtered |>
+        filter(black_pop > 0))
+```
+
+Fitting the model against the black population, we see a slight uptick towards the end of the average graph, and fitting a model directly against the population shows a positive relationship of the data. The model fit also suggests a positive relationship as the dial pulls increase we're expected to see an increase in population on average. This suggests the relationship to be increasing. For every 1 unit of increase in dial pulls, we're expected to see a .0798 increase in (log) population along with a t-statistic of 6.98 which indicates a relatively strong relationship and that the p-value received is 3.72e-12 and is well below the .05 mark to suggest the difference in means is not 0.
+
+```{r}
+#| echo: false
+
+parsnip_lm_fit_black |>
+  tidy()
+```
+
+# COMPONENT 5
+
+This component will focus on the task of predicting the current number of area codes assigned to each original area code region, given data concerning that regions which was available in 1950 (e.g. number of births, total region area, latitude/longitude, number dial pulls, etc).
+
+Your write-up should include
+
+-   Proposing five different candidate models for the current number of area codes. The models may differ on aspects such as the variables included, algorithm used to fit, link function, etc.
+
+-   Devising a criteria on which to judge model performance.
+
+-   Determining which model performs best based on these criteria. This usually should involve some sort of cross-validation.
+
+-   Interpret the results of this model selection task. What sort of insights does the winning model tell us about the data? Include at least two graphics to support your claims.
+
+## Summarize the data
+
+Here I am summarizing the full data set to understand for each original area code, observable features do we have to predict the end number of area codes. We have 75 original codes to work with.
+
+```{r}
+#| results: false
+
+c5 <- states_population_combined_dials |>
+  mutate(original_area_code = as.integer(original_area_code)) |>
+  filter(!is.na(original_area_code) &
+           !is.na(new_area_code)) |>
+  select(where(is.numeric)) |>
+  group_by(original_area_code) |>
+  summarize(total_area = sum(area),
+            total_perimeter = sum(perimeter),
+            n_new = n_distinct(new_area_code),
+            total_births = sum(births),
+            total_population = sum(population_1950),
+            total_population_under5 = sum(population_under5_1950),
+            total_population_over65 = sum(population_over65_1950),
+            total_black_pop = sum(black_pop),
+            total_telephones = sum(residence_telephones_1945)) |>
+  glimpse()
+
+c5_corrections <- splits_overlays |>
+  group_by(original_area_code) |>
+  summarize(count = n()) |>
+  glimpse()
+
+c5 <- c5 |>
+  left_join(c5_corrections) |>
+  mutate(n_new = count) |>
+  select(-count) |>
+  glimpse()
+```
+
+## Create Training and Test Data Sets
+
+```{r}
+#| results: false
+
+set.seed(1)
+
+c5_split <- c5 |>
+  initial_split(prop = .8)
+
+c5_train <- c5_split |>
+  training()
+
+c5_test <- c5_split |>
+  testing()
+```
+
+## Set Up Model Types
+
+```{r}
+# Create classification models
+regression_knn_1 <- nearest_neighbor(neighbors = 1,
+                                       weight_func = "rectangular") |>
+  set_engine("kknn") |>
+  set_mode("regression")
+
+regression_knn_2 <- nearest_neighbor(neighbors = 2,
+                                       weight_func = "rectangular") |>
+  set_engine("kknn") |>
+  set_mode("regression")
+
+regression_rf <- rand_forest() |>
+  set_engine("ranger") |>
+  set_mode("regression")
+```
+
+## Set Up Workflows
+
+```{r}
+# Model 1
+new_code_recipe_1 <- recipe(n_new ~
+                              total_area +    
+                              total_perimeter + 
+                              total_births + 
+                              total_population + 
+                              total_population_under5 + 
+                              total_population_over65 + 
+                              total_black_pop + 
+                              total_telephones,
+                            data = c5_train) |>
+  step_normalize(all_numeric_predictors())
+
+new_code_workflow_1 <- workflow() |>
+  add_model(regression_knn_1) |>
+  add_recipe(new_code_recipe_1)
+```
+
+```{r}
+# Model 2
+new_code_recipe_2 <- recipe(n_new ~
+                              total_area +    
+                              total_perimeter + 
+                              total_births + 
+                              total_population + 
+                              total_population_under5 + 
+                              total_population_over65 + 
+                              total_black_pop + 
+                              total_telephones,
+                            data = c5_train) |>
+  step_normalize(all_numeric_predictors())
+
+new_code_workflow_2 <- workflow() |>
+  add_model(regression_knn_2) |>
+  add_recipe(new_code_recipe_2)
+```
+
+```{r}
+# Model 3
+new_code_recipe_3 <- recipe(n_new ~
+                              total_area +    
+                              total_perimeter + 
+                              total_births + 
+                              total_population + 
+                              total_population_under5 + 
+                              total_population_over65 + 
+                              total_black_pop + 
+                              total_telephones,
+                            data = c5_train) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(),
+           num_comp = 5)
+
+new_code_workflow_3 <- workflow() |>
+  add_model(regression_knn_1) |>
+  add_recipe(new_code_recipe_3)
+```
+
+```{r}
+# Model 4
+new_code_recipe_4 <- recipe(n_new ~
+                              total_area +    
+                              total_perimeter + 
+                              total_births + 
+                              total_population + 
+                              total_population_under5 + 
+                              total_population_over65 + 
+                              total_black_pop + 
+                              total_telephones,
+                            data = c5_train) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(),
+           num_comp = 5)
+
+new_code_workflow_4 <- workflow() |>
+  add_model(regression_knn_2) |>
+  add_recipe(new_code_recipe_4)
+```
+
+```{r}
+# Model 5
+new_code_recipe_5 <- recipe(n_new ~
+                              total_area +    
+                              total_perimeter + 
+                              total_births + 
+                              total_population + 
+                              total_population_under5 + 
+                              total_population_over65 + 
+                              total_black_pop + 
+                              total_telephones,
+                            data = c5_train) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(),
+           num_comp = 5)
+
+new_code_workflow_5 <- workflow() |>
+  add_model(regression_rf) |>
+  add_recipe(new_code_recipe_5)
+```
+
+```{r}
+workflow_names <- c("knn_1_all",
+                    "knn_2_all",
+                    "knn_1_all_pca5",
+                    "knn_2_all_pca5",
+                    "rf_pca5")
+
+workflow_objects <- list(new_code_workflow_1,
+                         new_code_workflow_2,
+                         new_code_workflow_3,
+                         new_code_workflow_4,
+                         new_code_workflow_5)
+
+workflows_tbl <- tibble(work_names = workflow_names,
+                        work_objects = workflow_objects)
+```
+
+## Create Fitted values from the Training data and Predictions on the Test data
+
+```{r}
+#| results: false
+
+workflows_tbl <- workflows_tbl |>
+  rowwise() |>
+  mutate(fits = list(fit(work_objects,
+                         c5_train))) |>
+  mutate(predictions = list(predict(fits,
+                             c5_test)))
+```
+
+```{r}
+#| results: false
+
+predictions_tbl  <- workflows_tbl |>
+  select(work_names, 
+         predictions) |>
+  unnest(predictions) |>
+  glimpse()
+
+predictions_tbl <- predictions_tbl |>
+  cbind(n_new = c5_test |>
+          pull(n_new))
+```
+
+## View the Predictions in comparison to the observed values
+
+Below, we can view the relationship between predicted values of the model versus the observed values from the training data.
+
+```{r}
+#| echo: false
+
+predictions_tbl |>
+  ggplot(aes(x = n_new, 
+             y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, linetype = "dotted", color = "red") +
+  facet_wrap(~work_names) +
+  coord_obs_pred() + 
+  labs(title = "Predictions vs. Observations of Training Data",
+       x = "Number of New Codes",
+       y = "Predicted Number of New Codes")
+```
+
+## Create and Evaluate our metrics to judge the models
+
+```{r}
+#| results: false
+
+metrics <- metric_set(rmse,
+                      rsq_trad,
+                      mae)
+```
+
+```{r}
+#| echo: false
+
+predictions_metrics <- predictions_tbl |>
+  mutate(n_new = n_new,
+         .pred = .pred) |>
+  group_by(work_names) |>
+  metrics(truth = n_new, 
+          estimate = .pred)
+
+predictions_metrics |>
+  kable(caption = "Evaluation Metrics",
+       align = "l",
+       digits = 3)
+```
+
+```{r}
+#| echo: false
+
+predictions_metrics  |> 
+  ggplot(aes(y = work_names, 
+             x = .estimate)) + 
+  geom_col() +
+  facet_wrap(~.metric, 
+             scales = "free_x") +
+  theme(legend.position = "none") + 
+  labs(title = "Estimates for Each Model Type",
+       x = "Estimate",
+       y = "Model Type")
+```
+
+Currently, it looks like the k-nearest neighbors model originally choosing all predictors available but picking the best 5 principal components is showing the best performance on the test data at about .827 as closer to 1 is best. Additionally, the lower MAE and RMSE suggest a better fitting model. Here we see the lowest for k-nearest neighbors with 5 principal components as well.
+
+## Validation Testing
+
+```{r}
+#| echo: false
+#| warning: false
+
+set.seed(10)
+
+val_set <- validation_split(c5_train, 
+                            prop = 0.75)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+
+workflows_val <- tibble(work_names = workflow_names,
+                        work_objects = workflow_objects) |>
+  rowwise() |>
+  mutate(fits = list(fit_resamples(work_objects,
+                                   val_set,
+                                   metrics = metrics))) |>
+  mutate(metrics = list(collect_metrics(fits)))
+```
+
+```{r}
+#| echo: false
+
+workflows_val |>
+  select(c(work_names,
+           metrics)) |>
+  unnest(metrics) |>
+  ggplot(aes(y = work_names,
+             x = mean)) +
+  geom_col() +
+  facet_wrap(~.metric,
+             nrow = 1,
+             scales = "free_x") +
+  theme(legend.position = "none")
+```
+
+```{r}
+#| echo: false
+
+validation_performance <- workflows_val |>
+  select(c(work_names,
+           metrics)) |>
+  unnest(metrics) |>
+  select(work_names,
+         .metric,
+         .estimate = mean) |>
+  mutate(method = "validation")
+
+test_performance <- predictions_metrics |>
+  mutate(method = "test_data")
+
+validation_performance |>
+  bind_rows(test_performance) |>
+  ggplot(aes(y = work_names,
+             x = .estimate,
+             fill = method)) +
+  geom_col(position = "dodge") +
+    facet_wrap(~.metric,
+             nrow = 1,
+             scales = "free_x") 
+```
+
+Fitting the model using validation testing doesn't really show that the model worked that well, however. The best model seems to be the k-nearest neighbors with 1 neighbor fitting all predictors and removing none, but the accuracy drops to about .2 and the MAE and RMSE increase significantly. It might be better validating using v-fold since our sample sizes are small to begin with.
+
+## V-Fold Cross Validation
+
+```{r}
+#| echo: false
+
+set.seed(10)
+
+vfold_set <- c5_train |> 
+  vfold_cv(v = 10)
+```
+
+```{r}
+#| echo: false
+
+workflows_vfold <- tibble(work_names = workflow_names,
+                          work_objects = workflow_objects) |>
+  rowwise() |>
+  mutate(fits = list(fit_resamples(work_objects,
+                                   vfold_set,
+                                   metrics = metrics))) |>
+  mutate(metrics = list(collect_metrics(fits)))
+```
+
+```{r}
+#| echo: false
+
+vfold_performance <- workflows_vfold |>
+  select(c(work_names,
+           metrics)) |>
+  unnest(metrics) |>
+  select(work_names,
+         .metric,
+         .estimate = mean) |>
+  mutate(method = "vfold")
+
+
+validation_performance |>
+  bind_rows(test_performance,
+            vfold_performance) |>
+  filter(.metric == "mae") |>
+  ggplot(aes(y = work_names,
+             x = .estimate,
+             fill = method)) +
+  labs(x = "Mean Absolute Error",
+      y = "Model Type") + 
+  geom_col(position = "dodge") 
+```
+
+```{r}
+#| echo: false
+vfold_performance_wide <- vfold_performance |>
+  pivot_wider(
+    names_from = .metric,
+    values_from = .estimate
+  )
+
+vfold_performance_wide |> 
+  mutate(across(c(mae, rmse, rsq_trad), ~round(., 2))) |>
+  kable(
+    caption = "V-Fold Performance Metrics by Model",
+    align = "c"
+  )
+```
+
+Performing additional validation tests using v-fold validation shows that the Mean Absolute Error (MAE) estimate for k-nearest neighbors with 1 neighbor using all predictors and the random forest using 5 principal components performed equally. The Root Mean Squared Error (RMSE) for these two models helps us break the tie in performance. The Random Forest model shows a slightly better RMSE value of 2.02. While all of our R-Squared values are negative, the dataset we're using consists of only 75 rows. This certainly will give us an error as we don't have enough observations. In this case, it's better to judge with MAE and RMSE. Our Random Forest with 5 principal components is the best model.
+
+# COMPONENT 6
+
+Organize and present your results as a polished report in a Quarto HTML file. The document should be clearly communicated: section headings, brief descriptions of your analyses, and comments on the figures and results. Do not feel like you need to write at length, but it is worth practicing writing up your conclusions clearly and concisely, along with accompanying figures, without relying on presenting raw code.
+
+To maximize readability and presentation, use chunk modifiers such as `#| echo:FALSE`, `#| message: FALSE`, and `#| warning: FALSE` to avoid showing parts of your R code that are not related to the direct results.
+
+In addition to your polished report, I’d like the opportunity to review your code, so please submit the `.qmd` file alongside your report. If you choose to conduct some of your pre-analysis and assembling of the data in a separate `.R` or `.qmd` file, please include that in your submission as well.
+
+These 15 points associated with this section will be awarded based on the quality of how the results are presented in the report.
+
+------------------------------------------------------------------------
+
+This document serves as the output to satisfy Component 6.
